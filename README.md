@@ -197,23 +197,20 @@ This repo provide two ways of installation: **standalone mode** and **package mo
 ## Citation
 If you find _Utonia_ useful to your research, please consider citing our works as an acknowledgment. (੭ˊ꒳​ˋ)੭✧
 ```bib
-@misc{zhang2026utonia,
-      title={Utonia: Toward One Encoder for All Point Clouds}, 
-      author={Yujia Zhang and Xiaoyang Wu and Yunhan Yang and Xianzhe Fan and Han Li and Yuechen Zhang and Zehao Huang and Naiyan Wang and Hengshuang Zhao},
-      year={2026},
-      eprint={2603.03283},
-      archivePrefix={arXiv},
-      primaryClass={cs.CV},
-      url={https://arxiv.org/abs/2603.03283}, 
+@inproceedings{zhang2026utonia,
+    title={Utonia: Toward One Encoder for All Point Clouds}, 
+    author={Yujia Zhang and Xiaoyang Wu and Yunhan Yang and Xianzhe Fan and Han Li and Yuechen Zhang and Zehao Huang and Naiyan Wang and Hengshuang Zhao},
+    booktitle={ICML},
+    year={2026},
 }
 ```
 
 ```bib
 @inproceedings{zhang2025concerto,
-  title={Concerto: Joint 2D-3D Self-Supervised Learning Emerges Spatial Representations},
-  author={Zhang, Yujia and Wu, Xiaoyang and Lao, Yixing and Wang, Chengyao and Tian, Zhuotao and Wang, Naiyan and Zhao, Hengshuang},
-  booktitle={NeurIPS},
-  year={2025}
+    title={Concerto: Joint 2D-3D Self-Supervised Learning Emerges Spatial Representations},
+    author={Zhang, Yujia and Wu, Xiaoyang and Lao, Yixing and Wang, Chengyao and Tian, Zhuotao and Wang, Naiyan and Zhao, Hengshuang},
+    booktitle={NeurIPS},
+    year={2025}
 }
 ```
 
