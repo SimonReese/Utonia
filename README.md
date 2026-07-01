@@ -19,7 +19,7 @@ This repo is the official project repository of the paper **_Utonia: Toward One 
 - [Citation](#citation)
 
 ## Installation
-This repo provide two ways of installation: **standalone mode** and **package mode**.
+This repo provide two ways of installation: **standalone mode** and **package mode**. And thanks to [HubertLongshanks](https://github.com/HubertLongshanks), there are some docker images, [utonia-cuda128](https://hub.docker.com/r/hughbertlong/utonia-cuda-128-rtx-blackwell) and [utonia-cuda128-flashattn](https://hub.docker.com/r/hughbertlong/utonia-cu128-x86-ubuntu24.04-flashattn), as in [#28](https://github.com/Pointcept/Utonia/issues/28).
 - The **standalone mode** is recommended for users who want to use the code for quick inference and visualization. We provide a most easy way to install the environment by using `conda` environment file. The whole environment including `cuda` and `pytorch` can be easily installed by running the following command:
   ```bash
   # Create and activate conda environment named as 'utonia'
