@@ -15,3 +15,5 @@ outputs/
 */.DS_Store
 **/*.out
 Dockerfile
+output/*
+secrets.md
