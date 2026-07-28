@@ -1,3 +1,6 @@
+import os
+
+from huggingface_hub import repo_info
 import trimesh
 import numpy as np
 import open3d as o3d
@@ -18,8 +21,18 @@ print(flash_attn)
 # ------------ TORCH PARAMETERS ----------------------------------------
 device = "cuda" if torch.cuda.is_available() else "cpu"
 
-# ------------ PIPELINE PARAMETERS -------------------------------------
 
+# ------------ PATHS ---------------------------------------------------
+POINTCLOUD_DATASETS_FOLDER_PATH = "data-generation/pointclouds"
+POINTCLOUD_DATASET_NAME = "arrange-train"
+
+POINTCLOUD_EPISODE_SUBFOLDER = "da3"
+POINTCLOUD_FILENAME = "scene.glb"
+
+EMBEDDINGS_SUBFOLDER = "embeds"
+EMBEDDINGS_FILENAME = "spatial_pos_embeddings_single.npy"
+
+# ------------ PIPELINE PARAMETERS -------------------------------------
 # TABLE REMOVAL
 TABLE_REMOVAL_ITERATIONS = 4
 COLOR_BIN_SIZE = 48
@@ -36,12 +49,44 @@ UTONIA_LAYER_CONCATENATION = 4
 # --------------
 # SPATIAL EMBEDDINGS
 SPATIAL_BIN_SIZE = (3, 3, 3)
+# ----------------------------------------------------------------------
 
 def main():
     # Load utonia model
     utonia_model = load_utonia()
+
+    # Open dataset
+    dataset_path = os.path.join(POINTCLOUD_DATASETS_FOLDER_PATH, POINTCLOUD_DATASET_NAME)
+    tasks_list = get_tasks(dataset_path)
+    for task in tasks_list:
+        print(f"Opening task {task}")
+        task_path = os.path.join(dataset_path, task)
+        variation_ids = get_variations(task_path)
+        for variation in variation_ids:
+            print(f"Opening variation {variation}")
+            variation_path = os.path.join(task_path, f"variation{variation}")
+            episode_ids = get_episodes(variation_path)
+            for episode in episode_ids:
+                print(f"Opening episode {episode}")
+                episode_path = os.path.join(variation_path, f"episode{episode}")
+                print(episode_path)
+                
+                # Open scene.glb
+                pcd_path = os.path.join(episode_path, POINTCLOUD_EPISODE_SUBFOLDER, POINTCLOUD_FILENAME)
+                assert os.path.exists(pcd_path)
+
+                spatial_pos_embeddings = pipeline(utonia_model, pcd_path)
+
+                # Save output
+                dst = os.path.join(episode_path, EMBEDDINGS_SUBFOLDER)
+                os.makedirs(dst, exist_ok=True)
+                dst = os.path.join(dst, EMBEDDINGS_FILENAME)
+                np.save(dst, spatial_pos_embeddings)
+
+def pipeline(utonia_model, pcd_path) -> np.ndarray:
+    
     # Load and clean pcd
-    scene = load_pointcloud()
+    scene = load_pointcloud(pcd_path)
     cleaned = remove_table(scene)
     # Prepare pcd for utonia
     input = pcd_to_utonia_dict(cleaned)
@@ -86,20 +131,24 @@ def main():
     # -------- Clustering again ---
     old_labels = cluster_points(output_point)
 
+    # -------- Mean Embeddings ----
+    embeds = mean_embeddings(output_point, old_labels)
+
     # -------- Spatial Embeddings -
-    embeddings = extract_spatial_embeddings(output_point, old_coords, old_labels)
-    print(embeddings.shape)
+    #embeddings = extract_spatial_embeddings(output_point, old_coords, old_labels)
+    #print(embeddings.shape)
 
     # -------- Positional Encodings
-    spatial_pos_embeddings = add_positional_encodings(old_coords, old_labels, embeddings)
-    print(spatial_pos_embeddings.shape)
+    #spatial_pos_embeddings = add_positional_encodings(old_coords, old_labels, embeddings)
+    #print(spatial_pos_embeddings.shape)
 
+    return embeds
     # -------- Store arrays
-    np.save("spatial_pos_embeddings.npy", spatial_pos_embeddings)
+    #np.save("spatial_pos_embeddings.npy", spatial_pos_embeddings)
 
 # ------------ FILE LOADING ---------------------------------------------
-def load_pointcloud() -> trimesh.Scene:
-    input_scene: trimesh.Scene = trimesh.load_scene("scene-nomatrix.glb")
+def load_pointcloud(pcd_path) -> trimesh.Scene:
+    input_scene: trimesh.Scene = trimesh.load_scene(pcd_path)
     return input_scene
 
 # ------------ UTONIA INFERENCE ----------------------------------------
@@ -273,6 +322,22 @@ def compute_spatial_bin_embeddings(feat, coord, labels, K, bins=(3, 3, 3)) -> di
       
     return embeddings
 
+def mean_embeddings(utonia_output: Point, cluster_labels, K_clusters = 3) -> np.ndarray:
+    feat: torch.Tensor = utonia_output.feat[utonia_output.inverse]
+    labels = cluster_labels[utonia_output.inverse.cpu().numpy()]
+    mean_embeddings = torch.stack([
+        feat[labels == k].mean(dim=0) 
+        for k in range(K_clusters)]
+    )
+    
+    # Normalize
+    cluster_embeddings_norm = mean_embeddings / (  
+        mean_embeddings.norm(dim=-1, keepdim=True) + 1e-6  
+    )  # (K, D)
+
+    return cluster_embeddings_norm.cpu().numpy()
+
+
 # ------------ POSITIONAL ENCODINGS ------------------------------------
 def add_positional_encodings(coords, labels, spatial_embeddings: np.ndarray, K_clusters = 3) -> np.ndarray:
     # Compute centers
@@ -439,6 +504,33 @@ def dict_to_cuda(utonia_dict: dict):
         if isinstance(utonia_dict[key], torch.Tensor) and device == "cuda":  
             utonia_dict[key] = utonia_dict[key].cuda(non_blocking=True)
     return utonia_dict
+
+# ------------ DATASET TRAVERSAL ----------------------------------------
+def get_tasks(dataset_path: str) -> list:
+    assert os.path.exists(dataset_path)
+    tasks = os.listdir(dataset_path)
+    tasks.sort()
+    return tasks
+
+def get_variations(task_path: str) -> list:
+    assert os.path.exists(task_path)
+    folders = os.listdir(task_path)
+    ids = []
+    for folder in folders:
+        if "variation" not in folder: continue
+        ids.append(int(folder.replace("variation", "")))
+    ids.sort()
+    return ids
+
+def get_episodes(variation_path: str) -> list:
+    assert os.path.exists(variation_path)
+    folders = os.listdir(variation_path)
+    ids = []
+    for folder in folders:
+        if "episode" not in folder: continue
+        ids.append(int(folder.replace("episode", "")))
+    ids.sort()
+    return ids
 
 # ------------ Utility --------------------------------------------------
 class txtcolors:
