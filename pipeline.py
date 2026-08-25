@@ -1,10 +1,19 @@
 import os
+from pathlib import Path
+from pickle import FALSE
+from typing import Tuple, Union
 
 from huggingface_hub import repo_info
+import scipy as sp
+from sklearn.cluster import DBSCAN
 import trimesh
 import numpy as np
 import open3d as o3d
+from trimesh import visual
 import trimesh.scene
+import matplotlib.pyplot as plt
+import numpy as np
+import open3d as o3d
 import utonia
 import torch
 import torch.nn as nn
@@ -74,16 +83,30 @@ def main():
                 # Open scene.glb
                 pcd_path = os.path.join(episode_path, POINTCLOUD_EPISODE_SUBFOLDER, POINTCLOUD_FILENAME)
                 assert os.path.exists(pcd_path)
+                
+                # DEBUG
+                ep_folder = Path(pcd_path).parents[1]
+                if (os.path.exists(f"pipeline-temp-data/{ep_folder}/cleaned.png") and
+                    os.path.exists(f"pipeline-temp-data/{ep_folder}/clusters.png") and
+                    os.path.exists(f"pipeline-temp-data/{ep_folder}/filtered-clusters.png")):
+                    print(f"Found {task}/{variation}/episode{episode}")
+                    continue
 
-                spatial_pos_embeddings = pipeline(utonia_model, pcd_path)
+                spatial_pos_embeddings, image = pipeline(utonia_model, pcd_path)
 
-                # Save output
-                dst = os.path.join(episode_path, EMBEDDINGS_SUBFOLDER)
-                os.makedirs(dst, exist_ok=True)
-                dst = os.path.join(dst, EMBEDDINGS_FILENAME)
-                np.save(dst, spatial_pos_embeddings)
+                if spatial_pos_embeddings is None and image is None: continue
+                
+                if False:
+                    # Save output
+                    dst = os.path.join(episode_path, EMBEDDINGS_SUBFOLDER)
+                    os.makedirs(dst, exist_ok=True)
+                    dst_file = os.path.join(dst, EMBEDDINGS_FILENAME)
+                    np.save(dst_file, spatial_pos_embeddings)
+                    with open(f"{dst}/clusters.png", "wb") as f:
+                        f.write(image)
+                image = 0
 
-def pipeline(utonia_model, pcd_path) -> np.ndarray:
+def pipeline(utonia_model, pcd_path: str) -> Tuple[np.ndarray, bytes]:
     
     # Load and clean pcd
     scene = load_pointcloud(pcd_path)
@@ -93,20 +116,68 @@ def pipeline(utonia_model, pcd_path) -> np.ndarray:
     # Save original coords for later use
     original_coords: np.ndarray = input["coord"].copy() # type: ignore
     original_colors: np.ndarray = input["color"].copy() # type: ignore
+    # Remove sparse points
+    cleaned_coords, cleaned_colors, _ = remove_radius_outliers(original_coords, original_colors, points_nb=60, radius=0.03)
+    cleaned_coords, cleaned_colors, _ = remove_radius_outliers(cleaned_coords, cleaned_colors, points_nb=100, radius=0.03)
+    cleaned_coords, cleaned_colors, _ = remove_sparse_points(cleaned_coords, cleaned_colors, nb_neighbors=400)
+    scene = numpy_to_trimesh(cleaned_coords, cleaned_colors/255.0)      # <-------- CLEANED
+    #scene.show(line_settings={'point_size': 1.0})
+    input = None
+    input = pcd_to_utonia_dict(scene)
     # Transform input
     transform = utonia.transform.default(scale=UTONIA_SCALE_FIRST_PASS)
     input: dict[str, torch.Tensor] = transform(input)
     input = dict_to_cuda(input)
-    #scene = numpy_to_trimesh(original_coords, original_colors/255.0)
+
+    # Update scene
+    #scene = numpy_to_trimesh(cleaned_coords, cleaned_colors/255.0)
     #scene.show(line_settings={'point_size': 1.0})
-    #exit()
-    # Inference
-    output_point = utonia_inference(input, utonia_model, depth=UTONIA_LAYER_CONCATENATION)
+
+    ep_folder = Path(pcd_path).parents[1]
+    os.makedirs(f"pipeline-temp-data/{ep_folder}", exist_ok=True)
+    image = scene.save_image(resolution=(1920, 1080), line_settings={'point_size': 1.0})
+    with open(f"pipeline-temp-data/{ep_folder}/cleaned.png", "wb") as f:    # <-------- CLEANED
+        f.write(image)
+    
+    
 
     # ------- Clustering ----------
-    original_labels = cluster_points(output_point)
+    original_labels = cluster_spatial_dbscan(coords=cleaned_coords, eps=0.03, min_points=400)
     # Remove the largest area cluster
-    cleaned_coords, cleaned_colors = remove_largest_cluster(original_coords, original_colors, original_labels)
+    cleaned_coords, cleaned_colors = cleaned_coords, cleaned_colors #remove_largest_cluster(original_coords, original_colors, original_labels)
+    scene = visualize_cluster(cleaned_coords, original_labels, K_clusters=None)
+    #scene = numpy_to_trimesh(cleaned_coords, cleaned_colors/255.0)
+    image = scene.save_image(resolution=(1920, 1080), line_settings={'point_size': 1.0})
+    with open(f"pipeline-temp-data/{ep_folder}/clusters.png", "wb") as f:   # <-------- CLUSTERS
+        f.write(image)
+
+    top3_mask, top3_cluster_ids = keep_top_k_clusters(cleaned_coords, original_labels, K=3)
+    final_coords = cleaned_coords[top3_mask]
+    final_colors = cleaned_colors[top3_mask]
+    final_labels = original_labels[top3_mask]
+    scene = visualize_cluster(final_coords, final_labels, K_clusters=None)
+
+    # Pass to utonia
+    #scene = numpy_to_trimesh(final_coords, final_colors/255.0)
+    
+    image = scene.save_image(resolution=(1920, 1080), line_settings={'point_size': 1.0})    # <-------- FILTERED CLUSTERS
+    with open(f"pipeline-temp-data/{ep_folder}/filtered-clusters.png", "wb") as f:
+        f.write(image)
+    input = None
+    input = pcd_to_utonia_dict(scene)
+    # Transform input
+    transform = utonia.transform.default(scale=UTONIA_SCALE_FIRST_PASS)
+    input: dict[str, torch.Tensor] = transform(input)
+    input = dict_to_cuda(input)
+    # Inference
+    output_point = utonia_inference(input, utonia_model, depth=UTONIA_LAYER_CONCATENATION)
+    embeds = mean_embeddings(
+        utonia_output=output_point,
+        cluster_labels=final_labels,
+        #valid_mask=top3_mask,
+        K_clusters=len(top3_cluster_ids)
+    )
+    return None, None
     # Remove sparse points
     cleaned_coords, cleaned_colors, _ = remove_sparse_points(cleaned_coords, cleaned_colors)
     # Update scene
@@ -130,19 +201,34 @@ def pipeline(utonia_model, pcd_path) -> np.ndarray:
 
     # -------- Clustering again ---
     old_labels = cluster_points(output_point)
+    # Filtra il rumore mantenendo solo il corpo centrale di ogni oggetto
+    #valid_mask = filter_cluster_noise_dbscan(old_coords, old_labels, eps=0.15, min_points=30)
+    valid_mask, clean_labels = clean_post_clustering(
+        coords=old_coords, 
+        labels=old_labels, 
+        eps=0.03,         # Aumenta a 0.05 se cancella troppi punti dall'oggetto
+        min_points=20
+    )
 
+    final_coords = old_coords[valid_mask]
+    final_labels = clean_labels[valid_mask]
+    final_scene = visualize_cluster(final_coords, final_labels)
+    
+    # Get image
+    img_bytes = final_scene.save_image(resolution=(1920, 1080), line_settings={'point_size': 2.0})
+    
     # -------- Mean Embeddings ----
-    embeds = mean_embeddings(output_point, old_labels)
+    embeds = mean_embeddings(output_point, old_labels, valid_mask)
 
     # -------- Spatial Embeddings -
     #embeddings = extract_spatial_embeddings(output_point, old_coords, old_labels)
-    #print(embeddings.shape)
+    print(embeds.shape)
 
     # -------- Positional Encodings
     #spatial_pos_embeddings = add_positional_encodings(old_coords, old_labels, embeddings)
     #print(spatial_pos_embeddings.shape)
 
-    return embeds
+    return embeds, img_bytes
     # -------- Store arrays
     #np.save("spatial_pos_embeddings.npy", spatial_pos_embeddings)
 
@@ -191,7 +277,7 @@ def cluster_points(utonia_output: Point , K_cluster = 3) -> np.ndarray:
     # Feature normalization 
     feat = utonia_output.feat  # (N_grid, D)  
     feat_norm = feat / (feat.norm(dim=-1, keepdim=True) + 1e-6)
-    kmeans = KMeans(n_clusters=K_cluster, mode="cosine", verbose=1)
+    kmeans = KMeans(n_clusters=K_cluster, mode="euclidean", verbose=1)
     # Predict label for each N_grid point
     labels = kmeans.fit_predict(feat_norm)  # (N_grid,) int tensor  
 
@@ -207,6 +293,58 @@ def cluster_points(utonia_output: Point , K_cluster = 3) -> np.ndarray:
 
     points_labels = labels_np[utonia_output.inverse.cpu().numpy()]  # (N_original,)
     return points_labels 
+
+def cluster_points_DBSCAN(utonia_output: Point, eps: float = 0.05, min_samples: int = 15) -> np.ndarray:
+    """
+    Esegue il clustering DBSCAN sulle feature estratte da Utonia.
+    Restituisce i label per i punti originali (-1 = rumore).
+
+    Params
+    --------
+    :utonia_output: utonia output features
+    :eps: cosine distance threshold for same cluster. Increase to enlarge cluster
+    :min_samples: minumum points to  iindetify a cluster
+    """
+    # 1. Normalizzazione delle feature (fondamentale per la distanza coseno)
+    feat = utonia_output.feat  # (N_grid, D)  
+    feat_norm = feat / (feat.norm(dim=-1, keepdim=True) + 1e-6)
+    
+    # Passaggio a CPU/Numpy per scikit-learn
+    feat_np = feat_norm.cpu().numpy()
+
+    # 2. Esecuzione DBSCAN
+    # n_jobs=-1 usa tutti i core della CPU per velocizzare il calcolo
+    dbscan = DBSCAN(eps=eps, min_samples=min_samples, metric="cosine", n_jobs=-1)
+    
+    print("Esecuzione DBSCAN in corso sulle feature...")
+    labels_np = dbscan.fit_predict(feat_np)  # (N_grid,) int array (-1 per il rumore)
+    
+    # 3. Propagazione ai punti originali tramite punto.inverse
+    points_labels = labels_np[utonia_output.inverse.cpu().numpy()]  # (N_original,)
+    
+    n_clusters = len(set(labels_np)) - (1 if -1 in labels_np else 0)
+    print(f"DBSCAN ha trovato {n_clusters} cluster e {(labels_np == -1).sum()} punti di rumore (su griglia).")
+    
+    return points_labels
+
+def cluster_spatial_dbscan(coords: np.ndarray, eps: float = 0.03, min_points: int = 20) -> np.ndarray:
+    """
+    Esegue il clustering spaziale DBSCAN direttamente sulle coordinate 3D.
+    Restituisce un array di label di dimensione (N_original,).
+    I punti di rumore avranno label -1.
+    """
+    # Inizializza Open3D PointCloud
+    pcd = o3d.geometry.PointCloud()
+    pcd.points = o3d.utility.Vector3dVector(coords)
+    
+    # Clustering spaziale (molto più veloce e leggero di scikit-learn)
+    labels = np.array(pcd.cluster_dbscan(eps=eps, min_points=min_points, print_progress=False))
+    
+    # Calcola il numero di cluster trovati (ignorando il rumore -1)
+    num_clusters = len(set(labels)) - (1 if -1 in labels else 0)
+    print(f"Clustering Spaziale: trovati {num_clusters} oggetti fisici.")
+    
+    return labels
 
 def remove_largest_cluster(coords, colors, labels) -> tuple[np.ndarray, np.ndarray]:
     """Removes largest cluster spanning in xy area, returning the refined pointcloud and colors"""
@@ -240,6 +378,124 @@ def remove_largest_xy_surface_cluster(coord, labels_np) -> tuple[np.ndarray, np.
     mask = labels_np != largest_cluster  
       
     return mask, largest_cluster
+
+def filter_cluster_noise_dbscan(coords: np.ndarray, labels: np.ndarray, eps: float = 0.03, min_points: int = 15) -> np.ndarray:
+    """
+    Applica DBSCAN spaziale per ogni cluster K-Means e mantiene 
+    solo la componente densa principale di ciascun oggetto.
+    
+    eps: distanza massima tra due punti per essere considerati vicini (in metri/unità coordinate)
+    min_points: numero minimo di punti per formare una componente densa
+    """
+    clean_mask = np.zeros(len(coords), dtype=bool)
+    
+    for k in np.unique(labels):
+        mask_k = (labels == k)
+        pts_k = coords[mask_k]
+        indices_k = np.where(mask_k)[0]
+        
+        if len(pts_k) == 0:
+            continue
+            
+        # DBSCAN open3d sulle coordinate 3D del singolo cluster
+        pcd = o3d.geometry.PointCloud()
+        pcd.points = o3d.utility.Vector3dVector(pts_k)
+        db_labels = np.array(pcd.cluster_dbscan(eps=eps, min_points=min_points, print_progress=False))
+        
+        # Trova il sotto-cluster con il maggior numero di punti (escludendo il rumore -1)
+        valid_labels = db_labels[db_labels != -1]
+        if len(valid_labels) > 0:
+            largest_sub_cluster = np.bincount(valid_labels).argmax()
+            # Seleziona solo i punti della componente principale
+            keep_in_k = (db_labels == largest_sub_cluster)
+            clean_mask[indices_k[keep_in_k]] = True
+
+    return clean_mask
+
+def keep_top_k_clusters(coords: np.ndarray, labels: np.ndarray, K: int = 3) -> tuple[np.ndarray, np.ndarray]:
+    """
+    Identifica e mantiene solo i K cluster con il maggior numero di punti.
+    
+    Returns:
+        valid_mask: Maschera booleana (N,) con True per i punti dei top K cluster.
+        top_k_labels: Lista degli ID dei K cluster selezionati.
+    """
+    # Considera solo i label validi (esclude il rumore -1)
+    valid_points_labels = labels[labels != -1]
+    
+    if len(valid_points_labels) == 0:
+        print("Nessun cluster valido trovato!")
+        return np.zeros(len(coords), dtype=bool), np.array([])
+
+    # Calcola la frequenza di ciascun cluster
+    unique_labels, counts = np.unique(valid_points_labels, return_counts=True)
+    
+    # Ordina i cluster per numero di punti in ordine decrescente
+    sorted_indices = np.argsort(-counts)
+    top_k_labels = unique_labels[sorted_indices[:K]]
+    
+    print(f"Cluster totali: {len(unique_labels)}. Mantengo i top {len(top_k_labels)} con punti: {counts[sorted_indices[:K]]}")
+    
+    # Maschera booleana dei soli punti appartenenti ai Top K cluster
+    valid_mask = np.isin(labels, top_k_labels)
+    
+    return valid_mask, top_k_labels
+
+def clean_post_clustering(
+    coords: np.ndarray, 
+    labels: np.ndarray, 
+    eps: float = 0.03, 
+    min_points: int = 20
+) -> tuple[np.ndarray, np.ndarray]:
+    """
+    Filtra i cluster dopo il K-Means:
+    1. Isola ogni cluster ed esegue un DBSCAN spaziale 3D.
+    2. Mantiene solo la componente connessa più grande per ogni cluster.
+    3. Scarta i frammenti di rumore ed eventuali sbavature ai bordi.
+
+    Args:
+        coords: (N, 3) Coordinate 3D dei punti.
+        labels: (N,) Label assegnati dal K-Means.
+        eps: Distanza massima (in unità/metri) per considerare due punti vicini.
+        min_points: Numero minimo di punti per formare un sotto-cluster valido.
+
+    Returns:
+        valid_mask: Array booleano (N,) con True per i punti appartenenti agli oggetti puliti.
+        cleaned_labels: Array (N,) con i label filtrati.
+    """
+    valid_mask = np.zeros(len(coords), dtype=bool)
+    cleaned_labels = labels.copy()
+    
+    for k in np.unique(labels):
+        # 1. Estrai solo i punti appartenenti al cluster k
+        cluster_mask = (labels == k)
+        cluster_indices = np.where(cluster_mask)[0]
+        pts_k = coords[cluster_mask]
+        
+        if len(pts_k) == 0:
+            continue
+            
+        # 2. Crea PointCloud Open3D locale
+        pcd = o3d.geometry.PointCloud()
+        pcd.points = o3d.utility.Vector3dVector(pts_k)
+        
+        # 3. DBSCAN sulle sole coordinate spaziali del cluster k
+        db_labels = np.array(
+            pcd.cluster_dbscan(eps=eps, min_points=min_points, print_progress=False)
+        )
+        
+        # 4. Individua il sotto-cluster con il maggior numero di punti (escludendo il rumore -1)
+        valid_db_labels = db_labels[db_labels != -1]
+        if len(valid_db_labels) > 0:
+            largest_sub_cluster_id = np.bincount(valid_db_labels).argmax()
+            
+            # Maschera dei punti che appartengono al corpo principale dell'oggetto
+            main_body_mask = (db_labels == largest_sub_cluster_id)
+            
+            # Salva i punti validi nella maschera globale
+            valid_mask[cluster_indices[main_body_mask]] = True
+
+    return valid_mask, cleaned_labels
 
 # ------------ UTONIA TRANSFORMATIONS ----------------------------------
 def pcd_to_utonia_dict(scene: trimesh.Scene) -> dict:
@@ -322,13 +578,25 @@ def compute_spatial_bin_embeddings(feat, coord, labels, K, bins=(3, 3, 3)) -> di
       
     return embeddings
 
-def mean_embeddings(utonia_output: Point, cluster_labels, K_clusters = 3) -> np.ndarray:
+def mean_embeddings(utonia_output: Point, cluster_labels, valid_mask: np.ndarray = None, K_clusters = 3) -> np.ndarray:
     feat: torch.Tensor = utonia_output.feat[utonia_output.inverse]
-    labels = cluster_labels[utonia_output.inverse.cpu().numpy()]
-    mean_embeddings = torch.stack([
-        feat[labels == k].mean(dim=0) 
-        for k in range(K_clusters)]
-    )
+    
+    if valid_mask is not None:
+        valid_mask_tensor = torch.from_numpy(valid_mask).to(feat.device)
+        feat = feat[valid_mask_tensor]
+        cluster_labels = cluster_labels[valid_mask]
+    
+    means = []
+    for k in range(K_clusters):
+        mask_k = (cluster_labels == k)
+        if mask_k.sum() > 0:
+            mean_k = feat[mask_k].mean(dim=0)
+        else:
+            # Gestione caso limite se un cluster viene completamente rimosso dal filtro
+            mean_k = torch.zeros(feat.shape[-1], device=feat.device)
+        means.append(mean_k)
+        
+    mean_embeddings = torch.stack(means)  # (K, D)
     
     # Normalize
     cluster_embeddings_norm = mean_embeddings / (  
@@ -444,12 +712,23 @@ def remove_sparse_points(coord, colors, nb_neighbors=20, std_ratio=2.0):
     pcd = o3d.geometry.PointCloud()  
     pcd.points = o3d.utility.Vector3dVector(coord)  
     pcd.colors = o3d.utility.Vector3dVector(colors)  
-    
     pcd_clean, ind = pcd.remove_statistical_outlier(  
         nb_neighbors=nb_neighbors,  
         std_ratio=std_ratio  
     )  
       
+    return np.asarray(pcd_clean.points), np.asarray(pcd_clean.colors), ind
+
+def remove_radius_outliers(coord, colors, points_nb, radius):
+    # We use open3d function
+    pcd = o3d.geometry.PointCloud()  
+    pcd.points = o3d.utility.Vector3dVector(coord)  
+    pcd.colors = o3d.utility.Vector3dVector(colors)  
+    pcd_clean, ind = pcd.remove_radius_outlier(  
+        nb_points=points_nb, 
+        radius=radius
+    )
+    
     return np.asarray(pcd_clean.points), np.asarray(pcd_clean.colors), ind
 
 # ------------ POINTCLOUD CONVERSION FUNCTIONS --------------------------
@@ -533,6 +812,42 @@ def get_episodes(variation_path: str) -> list:
     return ids
 
 # ------------ Utility --------------------------------------------------
+def visualize_cluster(coords: np.ndarray, labels: np.ndarray, K_clusters: Union[int, None] = None) -> trimesh.Scene:
+    """
+    Mappa qualsiasi numero di cluster (anche > 3) a colori distinti.
+    Gestisce ID non consecutivi (es. 0, 1, 4) e assegna il grigio al rumore (-1).
+    """
+    # 1. Estrai gli ID dei soli cluster validi (escludendo il rumore -1)
+    unique_valid_clusters = np.unique(labels[labels != -1])
+    actual_n_clusters = len(unique_valid_clusters)
+    
+    n_colors = actual_n_clusters if K_clusters is None else K_clusters
+
+    # 2. Inizializza la maschera colori con il grigio neutro per il rumore (RGB: 0.5, 0.5, 0.5)
+    point_colors = np.ones((len(coords), 3), dtype=np.float32) * 0.5
+
+    # 3. Assegna i colori ai cluster validi
+    if n_colors > 0 and actual_n_clusters > 0:
+        # Scegli la palette ideale in base al numero di cluster
+        if n_colors <= 10:
+            cmap = plt.get_cmap("tab10")
+        elif n_colors <= 20:
+            cmap = plt.get_cmap("tab20")
+        else:
+            cmap = plt.get_cmap("hsv")
+
+        # Genera N colori ben distanziati
+        colors = cmap(np.linspace(0, 1, n_colors))[:, :3]
+
+        # Mappa ogni ID di cluster al suo colore corrispondente
+        for idx, cluster_id in enumerate(unique_valid_clusters[:n_colors]):
+            mask = (labels == cluster_id)
+            point_colors[mask] = colors[idx]
+
+    # 4. Crea e restituisce la scena Trimesh
+    cluster_scene = numpy_to_trimesh(coords, point_colors)
+    return cluster_scene
+
 class txtcolors:
     HEADER = '\033[95m'
     OKBLUE = '\033[94m'
