@@ -1,3 +1,53 @@
-[build-system]
-requires = ["setuptools>=61", "wheel"]
-build-backend = "setuptools.build_meta"
+[project]  
+name = "utonia"  
+version = "1.0"  
+description = "Cross-domain pre-trained 3D point cloud encoder"  
+requires-python = ">=3.11,<3.12"  
+dependencies = [
+    "torch",
+    "torchvision",
+    "torchaudio",
+    "numpy<=1.26.4",
+    "ninja",
+    "scipy",
+    "addict",
+    "timm",
+    "psutil",
+    "huggingface_hub",
+    "einops",
+    # demo extras
+    "open3d",
+    "matplotlib",
+    "opencv-python",
+    "camtools",
+    "trimesh",
+    "natsort",
+    "gradio",
+    # Fixing spconv version update, see https://github.com/traveller59/spconv/issues/752
+    "spconv-cu126",
+    "cumm==0.7.3",
+    "torch-scatter",
+    "pyglet<2",
+]  
+  
+[build-system]  
+requires = ["setuptools"]  
+build-backend = "setuptools.build_meta"  
+
+[tool.uv]  
+find-links = ["https://data.pyg.org/whl/torch-2.7.1+cu128.html"]  
+environments = ["sys_platform == 'linux'"]  
+
+[tool.uv.extra-build-dependencies]  
+torch-scatter = ["torch"]
+
+[tool.uv.sources]  
+torch         = { index = "pytorch-cu128" }  
+torchvision   = { index = "pytorch-cu128" }  
+torchaudio    = { index = "pytorch-cu128" }  
+flash-attn    = { git = "https://github.com/Dao-AILab/flash-attention.git" }  
+  
+[[tool.uv.index]]  
+name = "pytorch-cu128"  
+url  = "https://download.pytorch.org/whl/cu128"  
+explicit = true  

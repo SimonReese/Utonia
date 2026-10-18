@@ -1,16 +1,12 @@
 import os
 from pathlib import Path
-from pickle import FALSE
 from typing import Tuple, Union
 
-from huggingface_hub import repo_info
-import scipy as sp
 from sklearn.cluster import DBSCAN
 import trimesh
 import numpy as np
 import open3d as o3d
-from trimesh import visual
-import trimesh.scene
+from trimesh import Scene
 import matplotlib.pyplot as plt
 import numpy as np
 import open3d as o3d
@@ -40,6 +36,8 @@ POINTCLOUD_FILENAME = "scene.glb"
 
 EMBEDDINGS_SUBFOLDER = "embeds"
 EMBEDDINGS_FILENAME = "spatial_pos_embeddings_single.npy"
+
+DEBUG_DATA_FOLDER = "pipeline-temp-data"
 
 # ------------ PIPELINE PARAMETERS -------------------------------------
 # TABLE REMOVAL
@@ -85,88 +83,79 @@ def main():
                 assert os.path.exists(pcd_path)
                 
                 # DEBUG
-                ep_folder = Path(pcd_path).parents[1]
-                if (os.path.exists(f"pipeline-temp-data/{ep_folder}/cleaned.png") and
-                    os.path.exists(f"pipeline-temp-data/{ep_folder}/clusters.png") and
-                    os.path.exists(f"pipeline-temp-data/{ep_folder}/filtered-clusters.png")):
-                    print(f"Found {task}/{variation}/episode{episode}")
-                    continue
+                # ep_folder = Path(pcd_path).parents[1]
+                # if (os.path.exists(f"pipeline-temp-data/{ep_folder}/cleaned.png") and
+                #     os.path.exists(f"pipeline-temp-data/{ep_folder}/clusters.png") and
+                #     os.path.exists(f"pipeline-temp-data/{ep_folder}/filtered-clusters.png")):
+                #     print(f"Found {task}/{variation}/episode{episode}")
+                #     continue
 
-                spatial_pos_embeddings, image = pipeline(utonia_model, pcd_path)
-
-                if spatial_pos_embeddings is None and image is None: continue
+                spatial_pos_embeddings = pipeline(utonia_model, pcd_path)
                 
-                if False:
+                if True:
                     # Save output
                     dst = os.path.join(episode_path, EMBEDDINGS_SUBFOLDER)
                     os.makedirs(dst, exist_ok=True)
                     dst_file = os.path.join(dst, EMBEDDINGS_FILENAME)
+                    
+                    # Cleanup
+                    if os.path.exists(f"{dst}/clusters.png"): 
+                        print(f"{txtcolors.FAIL}Deleting {txtcolors.ENDC}{dst}/clusters.png")
+                        os.remove(f"{dst}/clusters.png")
+                    if os.path.exists(f"{dst}/spatial_pos_embeddings.npy"): 
+                        print(f"{txtcolors.FAIL}Deleting {txtcolors.ENDC}{dst}/spatial_pos_embeddings.npy")
+                        os.remove(f"{dst}/spatial_pos_embeddings.npy")
+                    
+                    if os.path.exists(dst_file): print(f"{txtcolors.WARNING}Overwriting {txtcolors.ENDC}{dst_file}")
                     np.save(dst_file, spatial_pos_embeddings)
-                    with open(f"{dst}/clusters.png", "wb") as f:
-                        f.write(image)
-                image = 0
 
-def pipeline(utonia_model, pcd_path: str) -> Tuple[np.ndarray, bytes]:
+def pipeline(utonia_model, pcd_path: str) -> np.ndarray: #Tuple[np.ndarray, bytes]:
     
+    # Construct debug visualization data
+    EPISODE_FOLDER_SUBPATH = Path(pcd_path).parents[1]
+    os.makedirs(DEBUG_EP_FOLDER_PATH := os.path.join(DEBUG_DATA_FOLDER, EPISODE_FOLDER_SUBPATH), exist_ok=True)
+
     # Load and clean pcd
     scene = load_pointcloud(pcd_path)
     cleaned = remove_table(scene)
-    # Prepare pcd for utonia
+    # Convert pcd to dict following utonia convention
     input = pcd_to_utonia_dict(cleaned)
-    # Save original coords for later use
+    # Extract colors and coords
     original_coords: np.ndarray = input["coord"].copy() # type: ignore
     original_colors: np.ndarray = input["color"].copy() # type: ignore
+    del input, scene, cleaned
+
     # Remove sparse points
     cleaned_coords, cleaned_colors, _ = remove_radius_outliers(original_coords, original_colors, points_nb=60, radius=0.03)
     cleaned_coords, cleaned_colors, _ = remove_radius_outliers(cleaned_coords, cleaned_colors, points_nb=100, radius=0.03)
     cleaned_coords, cleaned_colors, _ = remove_sparse_points(cleaned_coords, cleaned_colors, nb_neighbors=400)
-    scene = numpy_to_trimesh(cleaned_coords, cleaned_colors/255.0)      # <-------- CLEANED
-    #scene.show(line_settings={'point_size': 1.0})
-    input = None
-    input = pcd_to_utonia_dict(scene)
-    # Transform input
-    transform = utonia.transform.default(scale=UTONIA_SCALE_FIRST_PASS)
-    input: dict[str, torch.Tensor] = transform(input)
-    input = dict_to_cuda(input)
-
-    # Update scene
-    #scene = numpy_to_trimesh(cleaned_coords, cleaned_colors/255.0)
-    #scene.show(line_settings={'point_size': 1.0})
-
-    ep_folder = Path(pcd_path).parents[1]
-    os.makedirs(f"pipeline-temp-data/{ep_folder}", exist_ok=True)
-    image = scene.save_image(resolution=(1920, 1080), line_settings={'point_size': 1.0})
-    with open(f"pipeline-temp-data/{ep_folder}/cleaned.png", "wb") as f:    # <-------- CLEANED
-        f.write(image)
     
-    
+    # convert to trimesh and save scene representation
+    scene = numpy_to_trimesh(cleaned_coords, cleaned_colors/255.0)
+    save_trimesh_image(scene, DEBUG_EP_FOLDER_PATH, "cleaned.png")                          # <-------- CLEANED 
 
     # ------- Clustering ----------
+    # Cluster using spatial coordinates with Density-Based Spatial Clustering 
     original_labels = cluster_spatial_dbscan(coords=cleaned_coords, eps=0.03, min_points=400)
-    # Remove the largest area cluster
-    cleaned_coords, cleaned_colors = cleaned_coords, cleaned_colors #remove_largest_cluster(original_coords, original_colors, original_labels)
+    # Save scene in image
     scene = visualize_cluster(cleaned_coords, original_labels, K_clusters=None)
-    #scene = numpy_to_trimesh(cleaned_coords, cleaned_colors/255.0)
-    image = scene.save_image(resolution=(1920, 1080), line_settings={'point_size': 1.0})
-    with open(f"pipeline-temp-data/{ep_folder}/clusters.png", "wb") as f:   # <-------- CLUSTERS
-        f.write(image)
+    save_trimesh_image(scene, DEBUG_EP_FOLDER_PATH, "clusters.png")                         # <-------- CLUSTERS
 
+    # Keep only 3 cluster for the 3 objects
     top3_mask, top3_cluster_ids = keep_top_k_clusters(cleaned_coords, original_labels, K=3)
     final_coords = cleaned_coords[top3_mask]
     final_colors = cleaned_colors[top3_mask]
     final_labels = original_labels[top3_mask]
     scene = visualize_cluster(final_coords, final_labels, K_clusters=None)
-
-    # Pass to utonia
-    #scene = numpy_to_trimesh(final_coords, final_colors/255.0)
+    save_trimesh_image(scene, DEBUG_EP_FOLDER_PATH, "filtered-clusters.png")                # <-------- FILTERED CLUSTERS
     
-    image = scene.save_image(resolution=(1920, 1080), line_settings={'point_size': 1.0})    # <-------- FILTERED CLUSTERS
-    with open(f"pipeline-temp-data/{ep_folder}/filtered-clusters.png", "wb") as f:
-        f.write(image)
-    input = None
+    # -------- Utonia passage ------
+    # Construct final pointcloud with real colors
+    scene = numpy_to_trimesh(final_coords, final_colors/255.0)
+    # Prepare for utonia
     input = pcd_to_utonia_dict(scene)
     # Transform input
-    transform = utonia.transform.default(scale=UTONIA_SCALE_FIRST_PASS)
+    transform = utonia.transform.default(scale=UTONIA_SCALE_SECOND_PASS)
     input: dict[str, torch.Tensor] = transform(input)
     input = dict_to_cuda(input)
     # Inference
@@ -174,64 +163,11 @@ def pipeline(utonia_model, pcd_path: str) -> Tuple[np.ndarray, bytes]:
     embeds = mean_embeddings(
         utonia_output=output_point,
         cluster_labels=final_labels,
-        #valid_mask=top3_mask,
         K_clusters=len(top3_cluster_ids)
     )
-    return None, None
-    # Remove sparse points
-    cleaned_coords, cleaned_colors, _ = remove_sparse_points(cleaned_coords, cleaned_colors)
-    # Update scene
-    scene = numpy_to_trimesh(cleaned_coords, cleaned_colors/255.0)  # todo: fix color range
-    # DEBUG - visualize
-    #scene.show(line_settings={'point_size': 1.0})
-    # scene.export("processing.glb")
-
-    # ------- Utonia step 2 -------
-    input = pcd_to_utonia_dict(scene)
-    # Save old coords for later use
-    old_coords: np.ndarray = input["coord"].copy() # type: ignore
-    old_colors: np.ndarray = input["color"].copy() # type: ignore
-    # Transform again
-    transformv2 = utonia.transform.default(scale=UTONIA_SCALE_SECOND_PASS, normalize_coord=True)
-    input = transformv2(input)
-    input = dict_to_cuda(input)
-
-    # Inference
-    output_point = utonia_inference(input, utonia_model, depth=UTONIA_LAYER_CONCATENATION)
-
-    # -------- Clustering again ---
-    old_labels = cluster_points(output_point)
-    # Filtra il rumore mantenendo solo il corpo centrale di ogni oggetto
-    #valid_mask = filter_cluster_noise_dbscan(old_coords, old_labels, eps=0.15, min_points=30)
-    valid_mask, clean_labels = clean_post_clustering(
-        coords=old_coords, 
-        labels=old_labels, 
-        eps=0.03,         # Aumenta a 0.05 se cancella troppi punti dall'oggetto
-        min_points=20
-    )
-
-    final_coords = old_coords[valid_mask]
-    final_labels = clean_labels[valid_mask]
-    final_scene = visualize_cluster(final_coords, final_labels)
+    print(f"{txtcolors.OKGREEN}{embeds.shape}{txtcolors.ENDC}")
+    return embeds
     
-    # Get image
-    img_bytes = final_scene.save_image(resolution=(1920, 1080), line_settings={'point_size': 2.0})
-    
-    # -------- Mean Embeddings ----
-    embeds = mean_embeddings(output_point, old_labels, valid_mask)
-
-    # -------- Spatial Embeddings -
-    #embeddings = extract_spatial_embeddings(output_point, old_coords, old_labels)
-    print(embeds.shape)
-
-    # -------- Positional Encodings
-    #spatial_pos_embeddings = add_positional_encodings(old_coords, old_labels, embeddings)
-    #print(spatial_pos_embeddings.shape)
-
-    return embeds, img_bytes
-    # -------- Store arrays
-    #np.save("spatial_pos_embeddings.npy", spatial_pos_embeddings)
-
 # ------------ FILE LOADING ---------------------------------------------
 def load_pointcloud(pcd_path) -> trimesh.Scene:
     input_scene: trimesh.Scene = trimesh.load_scene(pcd_path)
@@ -578,33 +514,25 @@ def compute_spatial_bin_embeddings(feat, coord, labels, K, bins=(3, 3, 3)) -> di
       
     return embeddings
 
-def mean_embeddings(utonia_output: Point, cluster_labels, valid_mask: np.ndarray = None, K_clusters = 3) -> np.ndarray:
+def mean_embeddings(utonia_output: Point, cluster_labels: np.ndarray, K_clusters = 3) -> np.ndarray:
     feat: torch.Tensor = utonia_output.feat[utonia_output.inverse]
     
-    if valid_mask is not None:
-        valid_mask_tensor = torch.from_numpy(valid_mask).to(feat.device)
-        feat = feat[valid_mask_tensor]
-        cluster_labels = cluster_labels[valid_mask]
+    # Recupera gli ID reali dei cluster presenti nelle etichette
+    unique_clusters = np.unique(cluster_labels[cluster_labels != -1])
     
     means = []
-    for k in range(K_clusters):
-        mask_k = (cluster_labels == k)
+    for cluster_id in unique_clusters[:K_clusters]:
+        mask_k = (cluster_labels == cluster_id)
         if mask_k.sum() > 0:
             mean_k = feat[mask_k].mean(dim=0)
         else:
-            # Gestione caso limite se un cluster viene completamente rimosso dal filtro
             mean_k = torch.zeros(feat.shape[-1], device=feat.device)
         means.append(mean_k)
         
     mean_embeddings = torch.stack(means)  # (K, D)
-    
-    # Normalize
-    cluster_embeddings_norm = mean_embeddings / (  
-        mean_embeddings.norm(dim=-1, keepdim=True) + 1e-6  
-    )  # (K, D)
+    cluster_embeddings_norm = mean_embeddings / (mean_embeddings.norm(dim=-1, keepdim=True) + 1e-6)
 
     return cluster_embeddings_norm.cpu().numpy()
-
 
 # ------------ POSITIONAL ENCODINGS ------------------------------------
 def add_positional_encodings(coords, labels, spatial_embeddings: np.ndarray, K_clusters = 3) -> np.ndarray:
@@ -847,6 +775,13 @@ def visualize_cluster(coords: np.ndarray, labels: np.ndarray, K_clusters: Union[
     # 4. Crea e restituisce la scena Trimesh
     cluster_scene = numpy_to_trimesh(coords, point_colors)
     return cluster_scene
+
+def save_trimesh_image(scene: Scene, path, filename: str):
+    filepath = os.path.join(path, filename)
+    if os.path.exists(filepath): print(f"{txtcolors.WARNING}Overwriting file {filepath}{txtcolors.ENDC}")
+    image = scene.save_image(resolution=(1920, 1080), line_settings={'point_size': 1.0})
+    with open(filepath, "wb") as f:
+        f.write(image)
 
 class txtcolors:
     HEADER = '\033[95m'
